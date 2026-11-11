@@ -5,7 +5,8 @@ import pytest
 from cascade.domain.enums import AttemptStatus as A
 from cascade.domain.enums import PaymentStatus as P
 from cascade.domain.transitions import (
-    ATTEMPT_FINAL,
+    ATTEMPT_MONEY_FREE,
+    ATTEMPT_UNRESOLVED,
     PAYMENT_TERMINAL,
     IllegalTransition,
     TransitionKind,
@@ -36,6 +37,12 @@ LEGAL_ATTEMPT = {
     (A.UNKNOWN, A.VOIDED),
     (A.UNKNOWN, A.FAILED_NOT_CHARGED),
     (A.SUCCEEDED, A.REFUNDED_DUPLICATE),
+    # late success (8.3): provider charged an attempt we had settled; we cancelled it
+    (A.UNKNOWN, A.REFUNDED_DUPLICATE),
+    (A.DECLINED_SOFT, A.REFUNDED_DUPLICATE),
+    (A.DECLINED_HARD, A.REFUNDED_DUPLICATE),
+    (A.FAILED_NOT_CHARGED, A.REFUNDED_DUPLICATE),
+    (A.VOIDED, A.REFUNDED_DUPLICATE),
 }
 
 
@@ -104,13 +111,17 @@ def test_attempt_same_state_is_duplicate_noop(s: A) -> None:
 
 def test_terminal_sets() -> None:
     assert {P.SUCCEEDED, P.FAILED} == PAYMENT_TERMINAL
-    assert {
-        A.DECLINED_SOFT,
-        A.DECLINED_HARD,
-        A.FAILED_NOT_CHARGED,
-        A.VOIDED,
-        A.REFUNDED_DUPLICATE,
-    } == ATTEMPT_FINAL
+    assert {A.STARTED, A.UNKNOWN} == ATTEMPT_UNRESOLVED
+    # every status is exactly one of: unresolved, money-free, or the single success
+    assert ATTEMPT_UNRESOLVED | ATTEMPT_MONEY_FREE | {A.SUCCEEDED} == set(A)
+    assert not ATTEMPT_UNRESOLVED & ATTEMPT_MONEY_FREE
+
+
+def test_refunded_duplicate_is_final_and_declines_never_become_succeeded() -> None:
+    for s in A:
+        assert not transition_attempt(A.REFUNDED_DUPLICATE, s).applied
+    for s in (A.DECLINED_SOFT, A.DECLINED_HARD, A.FAILED_NOT_CHARGED, A.VOIDED):
+        assert transition_attempt(s, A.SUCCEEDED).kind is TransitionKind.REJECTED
 
 
 def test_out_of_order_event_cannot_regress_attempt() -> None:

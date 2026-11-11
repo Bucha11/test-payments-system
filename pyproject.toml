@@ -50,6 +50,8 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# Explicit early returns read better in the engine/routing code than merged conditions.
+ignore = ["SIM102", "SIM103"]
 
 [tool.mypy]
 python_version = "3.13"

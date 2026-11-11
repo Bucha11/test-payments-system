@@ -33,22 +33,33 @@ ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = {
         {A.SUCCEEDED, A.DECLINED_SOFT, A.DECLINED_HARD, A.FAILED_NOT_CHARGED, A.UNKNOWN}
     ),
     A.UNKNOWN: frozenset(
-        {A.SUCCEEDED, A.DECLINED_SOFT, A.DECLINED_HARD, A.VOIDED, A.FAILED_NOT_CHARGED}
+        {
+            A.SUCCEEDED,
+            A.DECLINED_SOFT,
+            A.DECLINED_HARD,
+            A.VOIDED,
+            A.FAILED_NOT_CHARGED,
+            A.REFUNDED_DUPLICATE,
+        }
     ),
-    # Only via late-success handling (8.3): the duplicate charge was cancelled.
+    # -> REFUNDED_DUPLICATE only via late-success handling (8.3): the provider reports a
+    # charge for an attempt we had already settled, and we cancelled that charge. It never
+    # goes through SUCCEEDED, so the "one SUCCEEDED attempt" index is never in the way.
     A.SUCCEEDED: frozenset({A.REFUNDED_DUPLICATE}),
-    A.DECLINED_SOFT: frozenset(),
-    A.DECLINED_HARD: frozenset(),
-    A.FAILED_NOT_CHARGED: frozenset(),
-    A.VOIDED: frozenset(),
+    A.DECLINED_SOFT: frozenset({A.REFUNDED_DUPLICATE}),
+    A.DECLINED_HARD: frozenset({A.REFUNDED_DUPLICATE}),
+    A.FAILED_NOT_CHARGED: frozenset({A.REFUNDED_DUPLICATE}),
+    A.VOIDED: frozenset({A.REFUNDED_DUPLICATE}),
     A.REFUNDED_DUPLICATE: frozenset(),
 }
 
 PAYMENT_TERMINAL = frozenset(s for s, nxt in PAYMENT_TRANSITIONS.items() if not nxt)
-# "Final" for an attempt = no outgoing edges. SUCCEEDED is not final (it can still become
-# REFUNDED_DUPLICATE) but it is resolved: the outcome of the charge is known.
-ATTEMPT_FINAL = frozenset(s for s, nxt in ATTEMPT_TRANSITIONS.items() if not nxt)
+# The outcome of the charge is not known yet: the engine must not move past such an attempt.
 ATTEMPT_UNRESOLVED = frozenset({A.STARTED, A.UNKNOWN})
+# Known not to hold money and cannot be charged later: safe to try the next provider.
+ATTEMPT_MONEY_FREE = frozenset(
+    {A.DECLINED_SOFT, A.DECLINED_HARD, A.FAILED_NOT_CHARGED, A.VOIDED, A.REFUNDED_DUPLICATE}
+)
 
 
 class TransitionKind(StrEnum):

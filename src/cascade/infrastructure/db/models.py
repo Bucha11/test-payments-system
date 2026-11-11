@@ -57,6 +57,7 @@ class PaymentRow(Base):
     route: Mapped[list[str]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
     deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     needs_review: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     failure_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

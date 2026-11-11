@@ -70,6 +70,7 @@ def test_lookup_to_attempt() -> None:
         attempt_status_for_lookup(LookupStatus.DECLINED, R.EXPIRED_CARD)
         is AttemptStatus.DECLINED_HARD
     )
+    assert attempt_status_for_lookup(LookupStatus.VOIDED, None) is AttemptStatus.VOIDED
     assert attempt_status_for_lookup(LookupStatus.NOT_FOUND, None) is None
     assert attempt_status_for_lookup(LookupStatus.UNKNOWN, None) is None
 

@@ -28,6 +28,8 @@ def attempt_status_for_lookup(
     """None = lookup did not resolve the attempt (NOT_FOUND / UNKNOWN)."""
     if status is LookupStatus.APPROVED:
         return AttemptStatus.SUCCEEDED
+    if status is LookupStatus.VOIDED:
+        return AttemptStatus.VOIDED
     if status is LookupStatus.DECLINED:
         assert reason is not None
         return attempt_status_for_decline(reason)
