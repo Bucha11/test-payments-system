@@ -1,4 +1,4 @@
-"""State machines for payments and attempts (spec section 5).
+"""State machines for payments and attempts.
 
 Every status change goes through `transition_payment` / `transition_attempt`.
 The engine, reconciliation, webhooks and polling all use the same functions, so:
@@ -42,7 +42,7 @@ ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = {
             A.REFUNDED_DUPLICATE,
         }
     ),
-    # -> REFUNDED_DUPLICATE only via late-success handling (8.3): the provider reports a
+    # -> REFUNDED_DUPLICATE only via late-success handling: the provider reports a
     # charge for an attempt we had already settled, and we cancelled that charge. It never
     # goes through SUCCEEDED, so the "one SUCCEEDED attempt" index is never in the way.
     A.SUCCEEDED: frozenset({A.REFUNDED_DUPLICATE}),

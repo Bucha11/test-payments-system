@@ -12,10 +12,13 @@
 ```bash
 make up     # api, worker, postgres, redis, mock_a, mock_b; миграции применяются при старте api
 make test   # unit + integration + property-тесты (Postgres/Redis из compose)
-make demo   # сценарии S1–S10 против поднятого стека, затем /stats и /providers
+make demo   # сценарии S1–S10 и BT1–BT3 против поднятого стека, затем /stats и /providers
 ```
 
-Нужны Docker (compose v2) и [uv](https://docs.astral.sh/uv/). API — `http://localhost:8000`
+Нужны Docker (compose v2) и [uv](https://docs.astral.sh/uv/); порты 5432, 6379, 8000, 8101,
+8102 должны быть свободны. Провайдеры: два mock-провайдера и
+[Braintree sandbox](#braintree-sandbox) — для него нужны ключи песочницы в `.env`, без них
+сервис работает только на mock'ах. API — `http://localhost:8000`
 (`POST /payments` с заголовком `Idempotency-Key`, `GET /payments/{id}`,
 `POST /webhooks/{provider}`, `GET /stats`, `GET /providers`).
 
@@ -74,8 +77,11 @@ curl -s -X POST http://localhost:8000/payments \
   обработки), `lookup_retries`, `unknown_max_age_s` (после этого неизвестный исход →
   `FAILED` + `needs_review`); дополнительно `lookup_backoff_s`,
   `reconcile_backoff_min_s/max_s`, `sweep_interval_s`.
-- `providers`: тип, `base_url`, `enabled`, `timeout_s`, `failure_threshold`, `cooldown_s`,
-  опционально `cancel_blocks_late_charge`.
+- `providers`: тип (`mock` / `braintree`), `base_url`, `enabled`, `timeout_s`,
+  `failure_threshold`, `cooldown_s`; опционально `cancel_blocks_late_charge`, `currencies`
+  (какие валюты аккаунт провайдера умеет проводить), `merchant_account_id` (Braintree).
+  Конфиг отклоняется, если одна попытка (`timeout_s × (lookup_retries + 2)`) может
+  длиться дольше аренды `lease_s`.
 - `routes`: правила по порядку, срабатывает первое подходящее. Условия `match`: `currency`,
   `country`, `amount_minor_gte`, `amount_minor_lt`, `bin_prefix`. Последнее правило —
   `default: true`. Элемент маршрута — имя провайдера или группа `{split: {mock_a: 70,
@@ -83,7 +89,8 @@ curl -s -X POST http://localhost:8000/payments \
   запасными; порядок детерминирован по id платежа.
 
 Переменные окружения (`.env`, шаблон — `.env.example`): `DATABASE_URL`, `REDIS_URL`,
-`ROUTING_CONFIG`, `WEBHOOK_SECRET`, `LOG_LEVEL`.
+`ROUTING_CONFIG`, `WEBHOOK_SECRET`, `LOG_LEVEL`, `BRAINTREE_ENVIRONMENT`,
+`BRAINTREE_MERCHANT_ID`, `BRAINTREE_PUBLIC_KEY`, `BRAINTREE_PRIVATE_KEY`.
 
 ### Mock-провайдер
 
@@ -101,6 +108,35 @@ curl -s -X POST http://localhost:8000/payments \
 - `GET /_admin/calls`, `GET /_admin/webhooks`, `POST /_admin/reset`.
 
 Пример: `curl -X POST localhost:8101/_admin/script -d '{"steps":["soft_decline:do_not_honor"]}' -H 'Content-Type: application/json'`.
+
+### Braintree sandbox
+
+Настоящий тестовый провайдер (`src/cascade/infrastructure/providers/braintree.py`,
+официальный SDK). Ключи берутся в панели песочницы (Settings → API) и кладутся в `.env`:
+`BRAINTREE_MERCHANT_ID`, `BRAINTREE_PUBLIC_KEY`, `BRAINTREE_PRIVATE_KEY`. Без них адаптер не
+создаётся и Braintree не попадает в маршруты.
+
+- Маршрут: `USD` + `country: US` → `[braintree, mock_a]` (аккаунт песочницы проводит
+  только USD; другая валюта — soft-отказ без сетевого вызова).
+- Исход выбирается тестовой суммой: `2000.00` → отказ 2000 Do Not Honor (soft, каскад на
+  mock_a), `2001.00` → 2001 Insufficient Funds (hard, стоп), `3000.00` → «processor network
+  unavailable» (soft); остальные суммы одобряются.
+- `charge` = `transaction.sale` с `order_id` = id попытки; `lookup` = поиск по `order_id`;
+  `cancel` = `void` до проведения расчёта и `refund` после.
+- У Braintree нет ключа идемпотентности и нет вебхуков на обычные списания, поэтому попытка
+  отправляется один раз, а неизвестный исход выясняется только через `lookup`. `cancel` не
+  останавливает запрос, который ещё в пути, поэтому `cancel_blocks_late_charge: false`:
+  если исход не выяснен, платёж уходит на сверку, а не к следующему провайдеру.
+- Токен: `fake-…` передаётся как nonce песочницы, `bt_<token>` — как сохранённый в Braintree
+  метод оплаты; любой другой токен в песочнице списывается тестовой картой, чтобы один
+  платёж мог пройти каскадом и через mock, и через Braintree.
+
+```bash
+curl -s -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: bt-$RANDOM" \
+  -d '{"amount_minor": 200000, "currency": "USD", "payment_method": {"token": "tok_visa", "country": "US"}}'
+# -> braintree DECLINED_SOFT (do_not_honor), mock_a SUCCEEDED
+```
 
 ### Команды
 
@@ -127,6 +163,7 @@ flowchart LR
     RD --> W
     ENG -->|charge / lookup / cancel, таймаут| MA[mock_a]
     ENG --> MB[mock_b]
+    ENG --> BT[Braintree sandbox]
 ```
 
 Модульный монолит: `domain` (статусы, единая функция переходов, таксономия отказов,
@@ -145,10 +182,10 @@ flowchart LR
 src/cascade/
   domain/          статусы, функция переходов, таксономия отказов, контракт адаптера (без I/O)
   application/     движок каскада, маршрутизация, конфиг, создание платежа, обработка вебхуков
-  infrastructure/  Postgres-репозиторий, Redis-breaker, адаптер mock, задачи Taskiq, сборка зависимостей
+  infrastructure/  Postgres-репозиторий, Redis-breaker, адаптеры mock и Braintree, задачи Taskiq, сборка зависимостей
   api/             FastAPI: роуты и схемы
 src/mock_provider/ mock-провайдер
-migrations/        Alembic (0001 — схема, 0002 — lease_owner)
+migrations/        Alembic (0001 — схема, 0002 — lease_owner, 0003 — webhook_events.processed_at)
 config/routing.yaml
 scripts/demo.py
 tests/unit, tests/integration
@@ -179,6 +216,31 @@ tests/unit, tests/integration
 | S12 | EUR+DE; сумма ≥ 50000 | маршруты по `routing.yaml` |
 | S13 | S1, S2, S3, S10 → `/stats` | 4 платежа, 2 успеха, `cascade_save_rate` 0.5 |
 | S14 | 1000 разворотов split 70/30 | mock_a первый в 70% ± 5%, порядок детерминирован |
+| — | вебхук об отказе пришёл раньше ответа APPROVED | списание отменено, `REFUNDED_DUPLICATE`, затем B; если отмена не прошла — `FAILED` + `needs_review`, B не вызывался |
+| — | вебхук получен, но процесс упал до обработки | повторная доставка обрабатывается, а не отбрасывается как дубль |
+| BT1 | Braintree sandbox одобряет | `SUCCEEDED` на Braintree, mock_a не вызывался |
+| BT2 | Braintree: отказ 2000 (soft) | каскад на mock_a, ровно одно списание |
+| BT3 | Braintree: отказ 2001 (hard) | `FAILED`, mock_a не вызывался |
+
+Тесты Braintree: unit-тесты адаптера на фейковом шлюзе (классификация ответов и ошибок,
+lookup, void/refund) идут всегда; тесты против настоящей песочницы
+(`tests/integration/test_braintree_sandbox.py`) пропускаются, если ключей нет.
+
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) на каждый push и pull request:
+
+- **lint-typecheck** — `make lint` (ruff) и `make typecheck` (mypy strict для `domain` и
+  `application`);
+- **test** — `make test`: все тесты против Postgres и Redis, поднятых через docker compose
+  прямо на раннере.
+
+Тесты против Braintree sandbox в CI тоже выполняются: ключи песочницы хранятся в
+**Repository secrets** (Settings → Secrets and variables → Actions) под именами
+`BRAINTREE_MERCHANT_ID`, `BRAINTREE_PUBLIC_KEY`, `BRAINTREE_PRIVATE_KEY` и передаются в
+шаг `make test` через `env:`. В репозитории ключей нет. Где секретов нет (форк, pull request
+из форка), эти тесты пропускаются, а остальные идут как обычно. Чтобы включить их в своём
+форке, добавьте три секрета с ключами своей песочницы.
 
 - **Property-тест (Hypothesis):** случайные скрипты и флаги для обоих провайдеров, платёж
   доводится до конечного статуса. Проверяется: инвариант ledger, `SUCCEEDED` без списания
@@ -193,7 +255,7 @@ tests/unit, tests/integration
 выясняет его у провайдера по тому же reference. Без этого «потерянное» списание было бы
 невидимо.
 
-**Политика неизвестного исхода (8.2).** Перейти к следующему провайдеру можно только когда
+**Политика неизвестного исхода.** Перейти к следующему провайдеру можно только когда
 текущая попытка *доказуемо* не держит денег и не сможет списать их позже: `lookup` с
 ретраями → `cancel` (только если отмена гарантирует, что reference больше не спишется) →
 иначе `PENDING_RECONCILIATION` и ответ 202, следующий провайдер **не** пробуется. Цена —
@@ -231,9 +293,7 @@ fencing-токен `lease_owner`: каждая запись движка про�
 
 UI, аутентификация и мульти-мерчант, 3-D Secure, публичные refunds/captures, хранение
 карт (только токены), Kubernetes, Prometheus/Grafana (есть JSON-логи и `/stats`),
-нагрузочные тесты, dunning (повторы через дни — другая задача), ML-роутинг. Адаптер
-Braintree (M7) не делался: нет sandbox-учётки; детали API нужно сверять с документацией
-(см. [NOTES.md](NOTES.md)).
+нагрузочные тесты, dunning (повторы через дни — другая задача), ML-роутинг.
 
 ## Известные ограничения
 
@@ -242,8 +302,8 @@ Braintree (M7) не делался: нет sandbox-учётки; детали AP
 **Деньги и сверка**
 - **Позднее списание без вебхука не обнаруживается.** Если провайдер сообщил об отказе
   или подтвердил отмену, а потом всё-таки списал и не прислал вебхук, сервис об этом не
-  узнает. В проде это закрывается сверкой с отчётами провайдера (settlement reports), здесь
-  её нет.
+  узнает. Braintree вебхуков на списания не шлёт вовсе. В проде это закрывается сверкой с
+  отчётами провайдера (settlement reports), здесь её нет.
 - **`needs_review` требует ручной работы.** Если неизвестный исход не прояснился за
   `unknown_max_age_s` (по умолчанию 15 минут) или поздний успех не удалось отменить,
   платёж помечается `needs_review`. Деньги в таком случае могут быть списаны; инструментов
@@ -286,16 +346,19 @@ Braintree (M7) не делался: нет sandbox-учётки; детали AP
 - **Нет аутентификации и мульти-мерчанта:** любой, кто достучится до API, может создать
   платёж (сознательно вне рамок задания).
 
-**Не реализовано**
-- **Адаптер Braintree (M7):** нет sandbox-учётки, детали API в спеке не проверены;
-  провайдер в конфиге выключен.
+**Провайдеры**
+- **Один токен на всех провайдеров.** В песочнице Braintree любой «чужой» токен списывается
+  тестовой картой. В проде нужен vault или сетевые токены, чтобы одна карта клиента
+  превращалась в токен каждого провайдера.
+- **Braintree только USD** (так настроен аккаунт песочницы); мультивалютность — это
+  отдельные merchant account'ы и `merchant_account_id` по валюте.
 - **Mock-провайдер хранит всё в памяти:** перезапуск контейнера теряет его ledger.
 
 ## Заметки для high-risk мерчанта в проде
 
 - **Падение провайдера/MID и закрытие аккаунта** — это событие маршрутизации: MID выводится
   из роутинга конфигом (`enabled: false`), breaker делает то же автоматически при сбоях.
-- **Лимиты объёма на MID и балансировка** — веса в `split` (8.7) плюс дневные/месячные
+- **Лимиты объёма на MID и балансировка** — веса в `split` плюс дневные/месячные
   капы на MID (здесь не реализованы; естественное место — фильтр при построении маршрута).
 - **Роутинг по BIN/гео/валюте** — правила `match` (валюта, страна, сумма, префикс BIN).
 - **Правила повторов платёжных систем** — некоторые коды отказа (например, «не повторять»
@@ -314,55 +377,55 @@ Braintree (M7) не делался: нет sandbox-учётки; детали AP
 ```text
 
 === S1  A approves
-payment 61cb1f46-2308-4d63-8462-043037c7c7bf: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment d690029e-03bd-4f1b-9954-d51d8e149537: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    SUCCEEDED           -                          24 ms
+    1  mock_a    SUCCEEDED           -                          18 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S5  A times out but charged -> lookup finds it, B never called
-payment 15bd07f1-7578-4ee6-8436-feaf79d43bac: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment 0d8c3f82-07b8-47ba-bf5c-7a62ad336303: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    SUCCEEDED           -                        3009 ms
+    1  mock_a    SUCCEEDED           -                        3004 ms
   ledger: 1 charge(s), expected 1 -> OK
   mock_b charge calls: 0
 
 === S2  A soft decline -> B approves
-payment 086423b5-e0d5-407e-ab2d-f8338945d325: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment 446cda67-3927-4249-8a59-ebb89be60f01: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    DECLINED_SOFT       do_not_honor                8 ms
-    2  mock_b    SUCCEEDED           -                          11 ms
+    1  mock_a    DECLINED_SOFT       do_not_honor                6 ms
+    2  mock_b    SUCCEEDED           -                           7 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S6  A hangs, would charge after 5 s -> cancelled (tombstone), B approves
-payment 5f4e164a-df47-4418-8e7e-550c414dae7a: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment 2b2c6417-94c5-4cd6-8f93-548b6e524964: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    VOIDED              provider_unavailable     3007 ms
-    2  mock_b    SUCCEEDED           -                           8 ms
+    1  mock_a    VOIDED              provider_unavailable     3004 ms
+    2  mock_b    SUCCEEDED           -                           6 ms
   ledger: 1 charge(s), expected 1 -> OK
   after 6 s: mock_a charged entries for this payment = 0
 
 === S6  (re-check after 6 s)
-payment 5f4e164a-df47-4418-8e7e-550c414dae7a: SUCCEEDED; route=['mock_a', 'mock_b']
+payment 2b2c6417-94c5-4cd6-8f93-548b6e524964: SUCCEEDED; route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    VOIDED              provider_unavailable     3007 ms
-    2  mock_b    SUCCEEDED           -                           8 ms
+    1  mock_a    VOIDED              provider_unavailable     3004 ms
+    2  mock_b    SUCCEEDED           -                           6 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S3  A hard decline -> stop, B never called
-payment afc23df4-4f3c-4e0d-b5bd-647efdf8bf10: FAILED (HTTP 201), reason=insufficient_funds; route=['mock_a', 'mock_b']
+payment b3b21e50-8263-4332-817c-84271dd7e62c: FAILED (HTTP 201), reason=insufficient_funds; route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    DECLINED_HARD       insufficient_funds          9 ms
+    1  mock_a    DECLINED_HARD       insufficient_funds          8 ms
   ledger: 0 charge(s), expected 0 -> OK
   mock_b charge calls: 0
 
 === S7  A unknown + lookup/cancel down -> parked, B never called
-payment 5bd5bae8-19f5-4ab6-b27c-1b8fb44ec017: PENDING_RECONCILIATION (HTTP 202); mock_b calls: 0
+payment 54f73824-53bb-49d4-aa75-ade7a4a91d14: PENDING_RECONCILIATION (HTTP 202); mock_b calls: 0
   outage over (flags cleared); waiting for the worker to reconcile...
 
 === S7  after reconciliation by the worker
-payment 5bd5bae8-19f5-4ab6-b27c-1b8fb44ec017: SUCCEEDED; route=['mock_a', 'mock_b']
+payment 54f73824-53bb-49d4-aa75-ade7a4a91d14: SUCCEEDED; route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    SUCCEEDED           -                        3006 ms
+    1  mock_a    SUCCEEDED           -                        3003 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S8  10 concurrent POSTs with one Idempotency-Key
@@ -370,59 +433,79 @@ payment 5bd5bae8-19f5-4ab6-b27c-1b8fb44ec017: SUCCEEDED; route=['mock_a', 'mock_
   provider charge calls: 1
 
 === S8  resulting payment
-payment add6e5df-a3c9-4a88-a0b1-f8c03c8e228f: SUCCEEDED; route=['mock_a', 'mock_b']
+payment 5f7d636d-6393-4755-99c5-0a21e80c0001: SUCCEEDED; route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    SUCCEEDED           -                          21 ms
+    1  mock_a    SUCCEEDED           -                           8 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S9a A approves, webhook delivered twice (duplicate is a no-op)
-payment 4b1a40a4-6e4f-400e-8ec5-3b56fcfda31f: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment 7c08d55e-ee38-4d90-8d5a-373234159a5d: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    SUCCEEDED           -                          10 ms
+    1  mock_a    SUCCEEDED           -                           8 ms
   ledger: 1 charge(s), expected 1 -> OK
   webhooks delivered: 2; status still SUCCEEDED
 
 === S9b A's cancel does NOT block the late charge -> B approves meanwhile
-payment a250a24f-c335-42c9-89d6-f5a101ca8ab6: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment 97683619-3b21-491f-b414-7a16a157b952: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    VOIDED              provider_unavailable     3020 ms
-    2  mock_b    SUCCEEDED           -                           9 ms
+    1  mock_a    VOIDED              provider_unavailable     3655 ms
+    2  mock_b    SUCCEEDED           -                          28 ms
   ledger: 1 charge(s), expected 1 -> OK
   waiting for A's late charge + its webhook...
 
 === S9b after late-success webhook: A cancelled -> REFUNDED_DUPLICATE
-payment a250a24f-c335-42c9-89d6-f5a101ca8ab6: SUCCEEDED; route=['mock_a', 'mock_b']
+payment 97683619-3b21-491f-b414-7a16a157b952: SUCCEEDED; route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    REFUNDED_DUPLICATE  provider_unavailable     3020 ms
-    2  mock_b    SUCCEEDED           -                           9 ms
+    1  mock_a    REFUNDED_DUPLICATE  provider_unavailable     3655 ms
+    2  mock_b    SUCCEEDED           -                          28 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S10 A and B soft decline -> FAILED, route exhausted
-payment 95dd6c97-51f2-4996-8807-392218c16717: FAILED (HTTP 201), reason=generic_decline; route=['mock_a', 'mock_b']
+payment 76f9a357-a400-4021-aeb9-d020557ff3d3: FAILED (HTTP 201), reason=generic_decline; route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    DECLINED_SOFT       do_not_honor                9 ms
-    2  mock_b    DECLINED_SOFT       generic_decline             8 ms
+    1  mock_a    DECLINED_SOFT       do_not_honor              116 ms
+    2  mock_b    DECLINED_SOFT       generic_decline            28 ms
   ledger: 0 charge(s), expected 0 -> OK
 
-=== S4.1 A returns 500 (unknown -> lookup NOT_FOUND -> cancel) -> B
-payment 9f4b9143-7e19-498a-9651-be45eae41f13: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+=== BT1 US card: Braintree sandbox approves
+payment 663f45fa-df97-42d6-afd5-ead7a7f5b5b3: SUCCEEDED (HTTP 201); route=['braintree', 'mock_a']
   seq  provider  status              reason                  duration
-    1  mock_a    VOIDED              provider_unavailable       10 ms
-    2  mock_b    SUCCEEDED           -                           8 ms
+    1  braintree SUCCEEDED           -                        1317 ms
+  ledger: 1 charge(s), expected 1 -> OK
+
+=== BT2 Braintree soft decline (2000 Do Not Honor) -> mock_a approves
+payment bb7e8c61-78c9-40c1-9e83-498ec6d420c6: SUCCEEDED (HTTP 201); route=['braintree', 'mock_a']
+  seq  provider  status              reason                  duration
+    1  braintree DECLINED_SOFT       do_not_honor              861 ms
+    2  mock_a    SUCCEEDED           -                           7 ms
+  ledger: 1 charge(s), expected 1 -> OK
+
+=== BT3 Braintree hard decline (2001 Insufficient Funds) -> stop, mock_a never called
+payment b65ecd16-56f9-4f3a-b12e-eecd28b358af: FAILED (HTTP 201), reason=insufficient_funds; route=['braintree', 'mock_a']
+  seq  provider  status              reason                  duration
+    1  braintree DECLINED_HARD       insufficient_funds        985 ms
+  ledger: 0 charge(s), expected 0 -> OK
+  mock_a charge calls: 0
+
+=== S4.1 A returns 500 (unknown -> lookup NOT_FOUND -> cancel) -> B
+payment efe523f8-e49d-4610-9c8c-93a0293eeaae: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+  seq  provider  status              reason                  duration
+    1  mock_a    VOIDED              provider_unavailable        6 ms
+    2  mock_b    SUCCEEDED           -                           7 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S4.2 A returns 500 (unknown -> lookup NOT_FOUND -> cancel) -> B
-payment f8e31723-fb34-42b6-8556-3a27b4c6bb3f: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment 5a7d30f4-3325-417b-a49b-dccb474ade3b: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    VOIDED              provider_unavailable        7 ms
-    2  mock_b    SUCCEEDED           -                           9 ms
+    1  mock_a    VOIDED              provider_unavailable        5 ms
+    2  mock_b    SUCCEEDED           -                           8 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === S4.3 A returns 500 (unknown -> lookup NOT_FOUND -> cancel) -> B
-payment 18d3a0f2-8d28-4016-bbd0-2de06152bf24: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment c1215729-20f3-4ce2-b3b7-46450ed62cf3: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
     1  mock_a    VOIDED              provider_unavailable        8 ms
-    2  mock_b    SUCCEEDED           -                           9 ms
+    2  mock_b    SUCCEEDED           -                           6 ms
   ledger: 1 charge(s), expected 1 -> OK
 
   /providers after 3 consecutive failures on A:
@@ -446,7 +529,7 @@ payment 18d3a0f2-8d28-4016-bbd0-2de06152bf24: SUCCEEDED (HTTP 201); route=['mock
   {
     "name": "braintree",
     "type": "braintree",
-    "enabled": false,
+    "enabled": true,
     "breaker_state": "CLOSED",
     "consecutive_failures": 0,
     "seconds_until_half_open": null
@@ -454,54 +537,65 @@ payment 18d3a0f2-8d28-4016-bbd0-2de06152bf24: SUCCEEDED (HTTP 201); route=['mock
 ]
 
 === S4.4 A's breaker is OPEN -> route is B only
-payment 0126eda0-036a-48c4-89df-dd44c186f6c5: SUCCEEDED (HTTP 201); route=['mock_b']
+payment 8d329688-6e32-4297-a058-6c900ebde2b0: SUCCEEDED (HTTP 201); route=['mock_b']
   seq  provider  status              reason                  duration
-    1  mock_b    SUCCEEDED           -                           7 ms
+    1  mock_b    SUCCEEDED           -                           5 ms
   ledger: 1 charge(s), expected 1 -> OK
   waiting 31 s for A's cooldown...
 
 === S4.5 after cooldown: one half-open probe goes to A, succeeds, breaker closes
-payment 3484c327-d563-424a-8038-8bdbbe0b790e: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
+payment af44dca7-c742-4f2f-a09f-d65489223092: SUCCEEDED (HTTP 201); route=['mock_a', 'mock_b']
   seq  provider  status              reason                  duration
-    1  mock_a    SUCCEEDED           -                          11 ms
+    1  mock_a    SUCCEEDED           -                           7 ms
   ledger: 1 charge(s), expected 1 -> OK
 
 === GET /stats?window_min=60
 {
   "window_min": 60,
   "overall": {
-    "payments": 15,
-    "succeeded": 13,
-    "failed": 2,
-    "succeeded_first_attempt": 7,
-    "cascade_saved": 6,
+    "payments": 55,
+    "succeeded": 47,
+    "failed": 8,
+    "succeeded_first_attempt": 25,
+    "cascade_saved": 22,
     "pending_reconciliation": 0,
     "needs_review": 0,
-    "cascade_eligible": 7,
-    "cascade_save_rate": 0.8571
+    "cascade_eligible": 25,
+    "cascade_save_rate": 0.88
   },
   "providers": {
-    "mock_a": {
-      "attempts": 14,
-      "approved": 6,
+    "braintree": {
+      "attempts": 6,
+      "approved": 2,
       "soft_declines": 2,
-      "hard_declines": 1,
-      "failed_unknown": 4,
-      "refunded_duplicates": 1,
-      "p50_ms": 10.9,
-      "p95_ms": 3012.9,
-      "approval_rate": 0.4286
+      "hard_declines": 2,
+      "failed_unknown": 0,
+      "refunded_duplicates": 0,
+      "p50_ms": 1040.8,
+      "p95_ms": 1322.5,
+      "approval_rate": 0.3333
+    },
+    "mock_a": {
+      "attempts": 48,
+      "approved": 22,
+      "soft_declines": 6,
+      "hard_declines": 3,
+      "failed_unknown": 13,
+      "refunded_duplicates": 4,
+      "p50_ms": 9.3,
+      "p95_ms": 3134.5,
+      "approval_rate": 0.4583
     },
     "mock_b": {
-      "attempts": 8,
-      "approved": 7,
-      "soft_declines": 1,
+      "attempts": 26,
+      "approved": 23,
+      "soft_declines": 3,
       "hard_declines": 0,
       "failed_unknown": 0,
       "refunded_duplicates": 0,
-      "p50_ms": 9.1,
-      "p95_ms": 11.1,
-      "approval_rate": 0.875
+      "p50_ms": 8.9,
+      "p95_ms": 202.5,
+      "approval_rate": 0.8846
     }
   }
 }
@@ -527,14 +621,14 @@ payment 3484c327-d563-424a-8038-8bdbbe0b790e: SUCCEEDED (HTTP 201); route=['mock
   {
     "name": "braintree",
     "type": "braintree",
-    "enabled": false,
+    "enabled": true,
     "breaker_state": "CLOSED",
     "consecutive_failures": 0,
     "seconds_until_half_open": null
   }
 ]
 
-ledger violations: 0
+ledger violations: 0 
 ```
 
 </details>

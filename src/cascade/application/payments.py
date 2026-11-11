@@ -1,4 +1,4 @@
-"""Use cases: create a payment idempotently (8.1 step 1), apply provider events (8.3, 8.4)."""
+"""Use cases: create a payment idempotently, apply provider events (webhooks)."""
 
 import hashlib
 import json
@@ -158,7 +158,7 @@ class ProviderEvents:
         return await self.handle_late_success(p, a)  # APPROVED, or UNKNOWN: cancel to be safe
 
     async def handle_late_success(self, p: Payment, a: Attempt) -> str:
-        """Provider charged an attempt we already settled otherwise (8.3). Undo that charge.
+        """Provider charged an attempt we already settled otherwise. Undo that charge.
 
         Net charges stay at one: cancel the late one and mark it REFUNDED_DUPLICATE, or, if
         the cancel does not go through, flag the payment for manual review.

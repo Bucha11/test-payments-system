@@ -14,7 +14,7 @@ from cascade.domain.transitions import (
     transition_payment,
 )
 
-# The spec's diagrams, written out by hand independently of the implementation table.
+# The state diagrams (DESIGN.md), written out by hand independently of the implementation table.
 LEGAL_PAYMENT = {
     (P.CREATED, P.PROCESSING),
     (P.CREATED, P.FAILED),  # no_route
@@ -37,7 +37,7 @@ LEGAL_ATTEMPT = {
     (A.UNKNOWN, A.VOIDED),
     (A.UNKNOWN, A.FAILED_NOT_CHARGED),
     (A.SUCCEEDED, A.REFUNDED_DUPLICATE),
-    # late success (8.3): provider charged an attempt we had settled; we cancelled it
+    # late success: provider charged an attempt we had settled; we cancelled it
     (A.UNKNOWN, A.REFUNDED_DUPLICATE),
     (A.DECLINED_SOFT, A.REFUNDED_DUPLICATE),
     (A.DECLINED_HARD, A.REFUNDED_DUPLICATE),

@@ -1,4 +1,4 @@
-"""Decline taxonomy (spec section 6).
+"""Decline taxonomy.
 
 The single question behind the table: "could a different provider/acquirer plausibly
 approve this?" Soft = yes, cascade to the next provider. Hard = no, stop.

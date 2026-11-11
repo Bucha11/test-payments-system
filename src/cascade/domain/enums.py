@@ -31,8 +31,9 @@ class ChargeOutcome(StrEnum):
 class LookupStatus(StrEnum):
     APPROVED = "APPROVED"
     DECLINED = "DECLINED"
-    # Extension of section 7: the reference existed and was voided (e.g. our own earlier
-    # cancel went through but its response was lost). Holds no money, cannot be charged.
+    # Beyond APPROVED/DECLINED/NOT_FOUND/UNKNOWN: the reference existed and was voided
+    # (e.g. our own earlier cancel went through but its response was lost). Holds no money,
+    # cannot be charged.
     VOIDED = "VOIDED"
     NOT_FOUND = "NOT_FOUND"
     UNKNOWN = "UNKNOWN"

@@ -1,4 +1,4 @@
-"""Domain must not depend on I/O frameworks (spec section 3)."""
+"""Domain must not depend on I/O frameworks."""
 
 import ast
 from pathlib import Path

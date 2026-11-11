@@ -1,4 +1,4 @@
-"""Taskiq broker and background jobs (8.3).
+"""Taskiq broker and background jobs.
 
 * reconcile_payment(payment_id): enqueued when a payment is parked in
   PENDING_RECONCILIATION (or a webhook resolves its unknown attempt).

@@ -16,6 +16,7 @@ flowchart LR
     INF --> DOM
     INF -->|httpx, explicit timeout| MA[mock_a]
     INF -->|httpx, explicit timeout| MB[mock_b]
+    INF -->|SDK in a thread, explicit timeout| BT[Braintree sandbox]
     INF --> PG[(PostgreSQL 16)]
     INF --> RD[(Redis 7)]
 ```
@@ -40,11 +41,11 @@ stateDiagram-v2
     FAILED --> [*]
 ```
 
-`CREATED -> FAILED` is not drawn in the spec's diagram but is required by 8.1 step 2
-(empty route fails before the payment is ever claimed).
+`CREATED -> FAILED`: an empty route (every provider disabled or its breaker open) fails the
+payment before it is ever claimed.
 
 Taking over a `PROCESSING` payment whose lease expired is **not** a status change: it is
-the conditional `UPDATE ... WHERE lease_until < now()` claim from 8.1 step 3. The claim
+the conditional `UPDATE ... WHERE lease_until < now()` claim. The claim
 also writes a fresh `lease_owner` token; every later engine write checks (and renews) it
 in the same short transaction, so a worker that lost its claim cannot write anything.
 In `PENDING_RECONCILIATION` the `lease_until` column means "not before": the next time
@@ -73,7 +74,7 @@ stateDiagram-v2
     VOIDED --> REFUNDED_DUPLICATE
 ```
 
-`* -> REFUNDED_DUPLICATE` is the late-success path (8.3): the provider reports a charge
+`* -> REFUNDED_DUPLICATE` is the late-success path: the provider reports a charge
 for an attempt we had already settled (or for a payment that is already terminal), we
 cancelled that charge. It deliberately does not go through `SUCCEEDED`, so the partial
 unique index "one SUCCEEDED attempt per payment" never gets in the way. A late success
@@ -105,7 +106,7 @@ its attempts and looks at the **last attempt**:
 | `SUCCEEDED` | done (payment was settled in the same transaction) |
 | `DECLINED_HARD` | `FAILED`, stop |
 | `STARTED` | previous worker crashed mid-call (or our write was lost): `UNKNOWN` |
-| `UNKNOWN` | 8.2: lookup ×N → cancel (if it blocks late charges) → else `PENDING_RECONCILIATION` + enqueue reconcile |
+| `UNKNOWN` | lookup ×N → cancel (if it blocks late charges) → else `PENDING_RECONCILIATION` + enqueue reconcile |
 
 A webhook, a crashed predecessor or a lost write therefore all go through the same path.
 Reconciliation (`PENDING_RECONCILIATION`) does one lookup per round; resolved → back into
@@ -117,17 +118,25 @@ The periodic sweep (inside the worker) picks up expired `PROCESSING` leases, due
 ## Webhooks
 
 Signature (HMAC-SHA256 of the raw body, `X-Signature`) → insert into `webhook_events`
-(duplicate `(provider, event_id)` → 200, no-op) → apply. A **success** event is only a
+(an already *processed* `(provider, event_id)` → 200, no-op) → apply → set
+`processed_at`. A row without `processed_at` (apply failed, or the process died in between)
+is applied again on redelivery; applying is idempotent. A **success** event is only a
 trigger: the handler calls `lookup()` and applies the provider's *current* state through the
 same transitions as polling (a webhook can be stale — e.g. sent before our own cancel voided
 the charge). Lookup unavailable → defer to reconciliation. Success for an attempt that is
 already settled, or a payment that is already terminal → late-success handling: cancel →
-`REFUNDED_DUPLICATE`, or `needs_review` if the cancel fails. If applying fails, the event row
-is deleted and 500 is returned so the provider redelivers.
+`REFUNDED_DUPLICATE`, or `needs_review` if the cancel fails. If applying fails, 500 is
+returned and the provider redelivers.
+
+The engine closes the mirror-image gap: if the provider answers APPROVED but the attempt was
+already moved (a decline webhook raced the response), the engine cancels that charge before
+it may try the next provider, or stops the cascade with `needs_review` if the cancel fails.
+
+Braintree sends no webhooks for card sales; its attempts are reconciled by lookup only.
 
 ## Lookup extension
 
-`LookupResult` has one value beyond section 7: `VOIDED` (the reference existed and was
+`LookupResult` has one value beyond APPROVED / DECLINED / NOT_FOUND / UNKNOWN: `VOIDED` (the reference existed and was
 voided, e.g. our earlier cancel went through but its response was lost). It maps to
 attempt `VOIDED` — holds no money, cannot be charged.
 
@@ -139,11 +148,12 @@ attempt `VOIDED` — holds no money, cannot be charged.
 `ChargeResult.declined(reason)` derives SOFT/HARD from the table, and `ChargeResult`
 refuses a soft/hard label that contradicts it, so an adapter cannot override the taxonomy.
 
-## Storage-level invariants (migration `0001`)
+## Storage-level invariants (migrations `0001`–`0003`)
 
 * `payments.idempotency_key` UNIQUE — idempotent creation.
 * `attempts (payment_id, seq)` UNIQUE — no two writers create the same attempt slot.
 * partial UNIQUE `attempts(payment_id) WHERE status = 'SUCCEEDED'` — the database itself
   refuses a second successful attempt row. (`REFUNDED_DUPLICATE` is outside the predicate.)
-* `webhook_events (provider, event_id)` UNIQUE — duplicate deliveries are no-ops.
+* `webhook_events (provider, event_id)` UNIQUE — duplicate deliveries of a processed event
+  are no-ops.
 * `amount_minor > 0` (bigint, minor units), `currency ~ '^[A-Z]{3}$'`.

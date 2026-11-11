@@ -1,4 +1,4 @@
-"""Provider adapter contract (spec section 7).
+"""Provider adapter contract.
 
 Adapters translate a provider's API into these types. Rules:
 * every call has an explicit timeout; adapters never retry (retry policy = engine);

@@ -1,4 +1,4 @@
-"""Acceptance scenarios (section 13). Every scenario ends with the ledger invariant."""
+"""Acceptance scenarios S1-S14 (see README). Every scenario ends with the ledger invariant."""
 
 import asyncio
 
@@ -19,7 +19,7 @@ def statuses(p: dict) -> list[tuple[str, str]]:
     return [(a["provider"], a["status"]) for a in p["attempts"]]
 
 
-# --------------------------------------------------------------------------- M2
+# ------------------------------------------------------------------------------------ basic cascade
 
 
 async def test_s1_approve_on_first_provider(env: Harness) -> None:
@@ -117,7 +117,7 @@ async def test_tombstoned_reference_is_failed_not_charged(env: Harness) -> None:
     assert res.outcome.value == "FAILED_NOT_CHARGED"
 
 
-# --------------------------------------------------------------------------- M3
+# -------------------------------------------------------------- unknown outcomes and reconciliation
 
 
 async def test_s5_timeout_charged_resolved_by_lookup(env: Harness) -> None:
@@ -244,7 +244,7 @@ async def test_s11_crash_after_write_ahead_recovered_by_sweep(env: Harness) -> N
     assert env.calls("mock_b") == []
 
 
-# --------------------------------------------------------------------------- M4
+# ------------------------------------------------------------------- webhooks, breaker, concurrency
 
 
 async def test_s4_breaker_opens_and_probes_after_cooldown(env: Harness) -> None:
@@ -398,7 +398,7 @@ async def test_no_route_when_all_breakers_open(make_env: HarnessFactory) -> None
     assert p["attempts"] == []
 
 
-# --------------------------------------------------------------------------- M6
+# -------------------------------------------------------------------------------- stats and routing
 
 
 async def test_s13_stats(env: Harness) -> None:

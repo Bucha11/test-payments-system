@@ -1,6 +1,6 @@
-"""Property test (section 13): random provider behaviour never breaks the money invariants.
+"""Property test: random provider behaviour never breaks the money invariants.
 
-For random scripts for A and B (any step from section 10) and random flag combinations,
+For random scripts for A and B (any mock step) and random flag combinations,
 a payment is driven to a terminal state: the API call, then reconciliation rounds driven
 by hand (outages end, the fake clock jumps forward so late charges land, webhooks are
 delivered). Then:

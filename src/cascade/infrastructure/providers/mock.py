@@ -1,6 +1,6 @@
 """Adapter for the mock provider (src/mock_provider).
 
-Classification of transport outcomes (section 7):
+Classification of transport outcomes (see domain/providers.py):
 * connection refused / connect timeout: the request never reached the provider
   -> FAILED_NOT_CHARGED;
 * 409 (reference cancelled / voided) and 4xx validation errors: provably not charged

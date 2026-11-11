@@ -1,4 +1,4 @@
-"""Read-only stats (8.6): SQL aggregates over payments and attempts, no extra storage."""
+"""Read-only stats: SQL aggregates over payments and attempts, no extra storage."""
 
 from typing import Any
 

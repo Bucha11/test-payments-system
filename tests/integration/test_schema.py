@@ -1,4 +1,4 @@
-"""The migration enforces the storage-level invariants from section 4."""
+"""The migration enforces the storage-level invariants (see DESIGN.md)."""
 
 import uuid
 

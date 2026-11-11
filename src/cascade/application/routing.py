@@ -1,4 +1,4 @@
-"""Route selection (section 9) and weighted expansion (8.7). Pure functions."""
+"""Route selection and weighted expansion. Pure functions."""
 
 import random
 from collections.abc import Mapping, Sequence

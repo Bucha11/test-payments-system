@@ -1,4 +1,4 @@
-"""Adapter classification of transport outcomes (section 7), with fake transports."""
+"""Adapter classification of transport outcomes, with fake transports."""
 
 import asyncio
 

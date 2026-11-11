@@ -1,21 +1,23 @@
 # NOTES
 
-Decisions taken where the spec was silent or self-contradictory, things deliberately left
-out, and environment caveats.
+Design decisions that are not obvious from the code, residual risks, and environment
+caveats.
 
-## Decisions (taken after M1 review: "go on")
+## Decisions
 
-1. **`CREATED -> FAILED` (`no_route`).** 5.1's diagram has no such edge, but 8.1 step 2
-   fails a payment before it is claimed. The edge exists.
-2. **Late success on a settled attempt (S9).** 5.2 only had `SUCCEEDED -> REFUNDED_DUPLICATE`,
-   but the engine only moves past an attempt once it is DECLINED_*, FAILED_NOT_CHARGED or
-   VOIDED, so a late "charged" for it could not be recorded and the money would stay on the
-   card. Added `{UNKNOWN, DECLINED_SOFT, DECLINED_HARD, FAILED_NOT_CHARGED, VOIDED} ->
-   REFUNDED_DUPLICATE` (never via SUCCEEDED, so the one-success index holds).
-3. **Fencing token `payments.lease_owner`** (migration 0002). The spec's claim query alone
+1. **`CREATED -> FAILED` (`no_route`).** A payment whose route is empty (every provider
+   disabled or its breaker open) fails before it is ever claimed, so the edge exists.
+2. **Late success on a settled attempt (S9).** `SUCCEEDED -> REFUNDED_DUPLICATE` alone is
+   not enough: the engine only moves past an attempt once it is DECLINED_*,
+   FAILED_NOT_CHARGED or VOIDED, so a late "charged" for such an attempt could not be
+   recorded and the money would stay on the card. Hence `{UNKNOWN, DECLINED_SOFT,
+   DECLINED_HARD, FAILED_NOT_CHARGED, VOIDED} -> REFUNDED_DUPLICATE` (never via SUCCEEDED,
+   so the one-success index holds).
+3. **Fencing token `payments.lease_owner`** (migration 0002). A lease-expiry claim alone
    lets a worker whose lease expired keep writing after the sweep took over. Every engine
    write checks and renews the token in the same transaction.
-4. **`LookupStatus.VOIDED`** in addition to section 7's four values (see DESIGN.md).
+4. **`LookupStatus.VOIDED`** in addition to APPROVED / DECLINED / NOT_FOUND / UNKNOWN
+   (see DESIGN.md).
 5. **Deadline uses the engine's clock** (`deadline_at` computed in the application, not by
    `now()` in SQL), so deadline checks and deadline creation use one time source.
 6. **Reconciliation backoff and next check.** No delayed-task infrastructure: a parked
@@ -51,30 +53,43 @@ out, and environment caveats.
     webhooks are applied directly (a decline cannot be undone by our cancel). Regression test:
     `test_stale_success_webhook_after_our_void_is_not_trusted`.
 
+14. **Braintree sandbox as the real provider.** The route `USD + country US` is
+    `[braintree, mock_a]`. Braintree has no idempotency key, so an attempt is sent once and
+    an unknown outcome is resolved by searching `order_id` (= attempt id). `cancel` voids
+    before settlement and refunds after; it cannot stop a request still in flight, so
+    `cancel_blocks_late_charge` is false and an unresolvable unknown outcome parks the
+    payment. Braintree sends no webhooks for card sales: lookup is the only reconciliation
+    path. The sandbox merchant account settles USD only (`currencies: [USD]`); another
+    currency is a soft decline without a network call. Any non-`fake-`/`bt_` token is
+    charged as a sandbox test card, so one payment can cascade between mocks and Braintree.
+    Our taxonomy decides soft/hard, not Braintree's `processor_response_type` (it calls
+    2001 insufficient funds "soft" meaning "retry later here").
+15. **Webhook dedupe on processed events** (migration 0003). Receiving and applying were
+    two steps; a crash between them left a row that turned every redelivery into a
+    "duplicate". Now only rows with `processed_at` are duplicates; applying is idempotent.
+16. **An APPROVED response that cannot be recorded is undone.** If the attempt was moved
+    meanwhile (a decline webhook raced the response), the engine cancels the charge before
+    the loop may try the next provider; if the cancel fails, the payment fails with
+    `unrecorded_charge` + `needs_review` and no further provider is called.
+17. **Lease vs. provider timeout is validated.** One attempt can run
+    `timeout_s x (lookup_retries + 2)` without a write (charge, lookups, cancel); the config
+    is rejected unless that is below `lease_s`, otherwise a sweeper would take the payment
+    over mid-step.
+18. **Mock webhook event ids are unique across restarts.** They used to restart at
+    `evt_1`, and the API dedupes on event id forever, so after a mock restart new events
+    were dropped as duplicates (seen as S9b failing on a second `make demo`).
+
 ## Residual risks (by design, flagged not hidden)
 
 * A provider that reports "declined" and later charges anyway, while the cascade already
   succeeded elsewhere: the webhook path cancels the late charge; if that cancel fails the
-  payment is flagged `needs_review`. Without a webhook nothing notices it; a periodic
-  provider-side settlement report reconciliation would (out of scope).
+  payment is flagged `needs_review`. Without a webhook (Braintree sends none for sales)
+  nothing notices it; a periodic settlement-report reconciliation would (out of scope).
 * `unknown_max_age_s` exceeded with lookup still failing: `FAILED` + `needs_review`; if the
   provider did charge, it is a manual case by definition.
 
-## Milestone status
+## Environment caveats
 
-* M1–M5: done; scenarios S1–S12 and the property test are green.
-* M6.1 `/stats`, `/providers`: done, S13 green; the demo prints both.
-* M6.2 weighted routing: done, S14 green (unit test).
-* M6.3 GitHub Actions: ruff, mypy (domain + application, strict), `make test`.
-* M7 Braintree: **not done** — no sandbox credentials in `.env`, and section 15 details are
-  explicitly unverified. `braintree` stays in `routing.yaml` with `enabled: false`; no adapter
-  is built for it, so it never enters a route.
-
-## Environment caveats (the sandbox this was built in)
-
-* Docker Hub returned 429 and container builds had no direct network. The stack was run
-  with the same images from `mirror.gcr.io` and the app image built with the sandbox
-  proxy CA injected through a throw-away Dockerfile (not committed). `docs/demo-output.txt`
-  is from that real run. On a normal machine `make up` needs nothing extra.
 * redis-py >= 8 defaults `socket_timeout` to 5 s; taskiq-redis consumes with an unbounded
   BRPOP, so the worker died every 5 s. The broker sets `socket_timeout=None` explicitly.
+* Host port 5432 must be free for `make up` / `make test` (a local PostgreSQL will clash).

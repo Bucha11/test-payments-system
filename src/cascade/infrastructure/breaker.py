@@ -1,4 +1,4 @@
-"""Per-provider circuit breaker in Redis (8.5).
+"""Per-provider circuit breaker in Redis.
 
 Stored per provider: hash `breaker:<name>` {failures, opened_at} and a probe key.
 State is derived, not stored:
