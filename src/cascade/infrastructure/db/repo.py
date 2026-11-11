@@ -347,22 +347,31 @@ class SqlPaymentRepository:
 
     # ---------------------------------------------------------------- webhooks
 
-    async def record_webhook(self, provider: str, event_id: str, payload: dict[str, Any]) -> bool:
-        """True if this event is new; False for a duplicate delivery."""
+    async def claim_webhook(self, provider: str, event_id: str, payload: dict[str, Any]) -> bool:
+        """True if the event still has to be applied; False if it already was (duplicate).
+
+        A row without `processed_at` means an earlier delivery was received but not applied
+        (it failed, or the process died in between): the redelivery applies it again.
+        Applying is idempotent (conditional transitions), so a concurrent redelivery that
+        also gets True is harmless.
+        """
         async with self.sm.begin() as s:
-            res = await s.execute(
+            await s.execute(
                 pg_insert(WebhookEventRow)
                 .values(provider=provider, event_id=event_id, payload=payload)
                 .on_conflict_do_nothing(constraint="uq_webhook_events")
-                .returning(WebhookEventRow.id)
             )
-            return res.first() is not None
-
-    async def forget_webhook(self, provider: str, event_id: str) -> None:
-        """Processing failed: drop the row so the provider's redelivery is processed."""
-        async with self.sm.begin() as s:
-            await s.execute(
-                WebhookEventRow.__table__.delete().where(
+            processed = await s.scalar(
+                select(WebhookEventRow.processed_at).where(
                     WebhookEventRow.provider == provider, WebhookEventRow.event_id == event_id
                 )
+            )
+            return processed is None
+
+    async def mark_webhook_processed(self, provider: str, event_id: str) -> None:
+        async with self.sm.begin() as s:
+            await s.execute(
+                update(WebhookEventRow)
+                .where(WebhookEventRow.provider == provider, WebhookEventRow.event_id == event_id)
+                .values(processed_at=func.now())
             )

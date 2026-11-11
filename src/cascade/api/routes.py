@@ -82,7 +82,7 @@ async def webhook(provider: str, request: Request) -> dict[str, str]:
     except (ValueError, KeyError, TypeError):
         raise HTTPException(400, "malformed event") from None
 
-    if not await svc.repo.record_webhook(provider, event_id, payload):
+    if not await svc.repo.claim_webhook(provider, event_id, payload):
         return {"status": "duplicate"}
     code = payload.get("code")
     ev = ProviderEvent(
@@ -93,11 +93,10 @@ async def webhook(provider: str, request: Request) -> dict[str, str]:
         raw_code=code,
         provider_txn_id=payload.get("txn_id"),
     )
-    try:
-        result = await svc.events.apply(ev)
-    except Exception:
-        await svc.repo.forget_webhook(provider, event_id)  # let the provider redeliver
-        raise
+    # If applying fails (or the process dies here), the event stays unprocessed and the
+    # provider's redelivery applies it.
+    result = await svc.events.apply(ev)
+    await svc.repo.mark_webhook_processed(provider, event_id)
     log.info(
         "webhook applied", extra={"provider": provider, "event_id": event_id, "result": result}
     )

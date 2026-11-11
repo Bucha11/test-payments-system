@@ -1,4 +1,4 @@
-"""Cascade engine (sections 8.1-8.3).
+"""Cascade engine: main loop, unknown-outcome resolution, reconciliation.
 
 Shape of the algorithm, in one place:
 
@@ -11,7 +11,7 @@ Shape of the algorithm, in one place:
                 SUCCEEDED            -> done (payment was settled in the same transaction)
                 DECLINED_HARD        -> FAILED, stop
                 STARTED              -> crashed mid-call: mark UNKNOWN, loop
-                UNKNOWN              -> resolve (8.2) or park in PENDING_RECONCILIATION
+                UNKNOWN              -> resolve (lookup / cancel) or park in PENDING_RECONCILIATION
                 money-free otherwise -> fall through and try the next provider
             budget / route / max_attempts left?  no -> FAILED with the last reason
             write-ahead attempt STARTED (committed) -> charge() -> record breaker -> persist
@@ -140,7 +140,7 @@ class CascadeEngine:
         await self.repo.set_route(p.id, route)  # no-op if a concurrent caller won
         return True
 
-    # ------------------------------------------------------------------ main loop (8.1)
+    # ------------------------------------------------------------------ main loop
 
     async def _drive(self, pid: UUID, token: UUID) -> None:
         for _ in range(4 * self.c.max_attempts + 8):
@@ -200,17 +200,48 @@ class CascadeEngine:
         )
         to = attempt_status_for_charge(r.outcome)
         if to is A.SUCCEEDED:
-            await self.repo.succeed(attempt.payment_id, attempt.id, A.STARTED, data, token)
+            if not await self.repo.succeed(attempt.payment_id, attempt.id, A.STARTED, data, token):
+                await self._undo_unrecorded_charge(attempt, token)
         else:
             if to is A.FAILED_NOT_CHARGED and data.reason is None:
                 data = AttemptUpdate(UNAVAILABLE, r.raw_code, r.raw_message, r.provider_txn_id)
             await self.repo.update_attempt(attempt.id, A.STARTED, to, data, token)
         # If the conditional write did not apply, the next loop iteration sees why.
 
+    async def _undo_unrecorded_charge(self, attempt: Attempt, token: UUID) -> None:
+        """The provider approved, but the attempt had already been moved elsewhere (e.g. a
+        decline webhook raced the response). We know money was taken that our records do
+        not show. The next loop iteration would see a money-free attempt and charge the next
+        provider, so the charge is cancelled first; if that fails, the cascade stops.
+        """
+        a = await self.repo.get_attempt(attempt.id)
+        assert a is not None
+        if a.status in (A.SUCCEEDED, A.REFUNDED_DUPLICATE):
+            return
+        log.error(
+            "approved charge could not be recorded; cancelling it",
+            extra={"payment_id": str(a.payment_id), "attempt_id": str(a.id), "status": a.status},
+        )
+        adapter = self.adapters.get(a.provider)
+        if adapter is not None:
+            cr = await adapter.cancel(str(a.id))
+            if cr.status is CancelStatus.CANCELLED and await self.repo.update_attempt(
+                a.id, a.status, A.REFUNDED_DUPLICATE, AttemptUpdate(), token
+            ):
+                return  # money returned: the cascade may go on
+        await self.repo.finish_payment(
+            a.payment_id,
+            P.PROCESSING,
+            P.FAILED,
+            token,
+            reason="unrecorded_charge",
+            needs_review=True,
+        )
+
     async def _fail(self, pid: UUID, token: UUID, reason: str) -> None:
         await self.repo.finish_payment(pid, P.PROCESSING, P.FAILED, token, reason=reason)
 
-    # ------------------------------------------------------------------ unknown outcome (8.2)
+    # ------------------------------------------------------------------ unknown outcome
 
     async def _apply_lookup(self, adapter: ProviderAdapter, a: Attempt, token: UUID) -> bool:
         """One lookup. True if it resolved the attempt (and the result is persisted)."""
@@ -264,7 +295,7 @@ class CascadeEngine:
         except Exception:  # the periodic sweep picks it up anyway
             log.exception("enqueue failed; sweep will pick the payment up")
 
-    # ------------------------------------------------------------------ reconciliation (8.3)
+    # ------------------------------------------------------------------ reconciliation
 
     async def _reconcile(self, pid: UUID, token: UUID) -> None:
         attempts = await self.repo.attempts(pid)

@@ -1,4 +1,4 @@
-"""Mock payment provider (section 10). One codebase, run as two containers.
+"""Mock payment provider. One codebase, run as two containers.
 
 State is in memory. Behaviour of the next charges is scripted through /_admin/script;
 `GET /_admin/ledger` is the ground truth for tests: what was actually charged.
@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import asdict, dataclass, field
@@ -87,7 +88,9 @@ class MockState:
             return
         self._event_seq += 1
         body = {
-            "event_id": f"{self.name}_evt_{self._event_seq}",
+            # Unique across restarts: the API dedupes on (provider, event_id) forever, so a
+            # counter that restarts at 1 would make new events look like old duplicates.
+            "event_id": f"{self.name}_evt_{self._event_seq}_{uuid.uuid4().hex[:12]}",
             "type": "charge.succeeded" if rec.state == "charged" else "charge.declined",
             "reference": rec.reference,
             "txn_id": rec.txn_id,
