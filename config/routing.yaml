@@ -1,0 +1,19 @@
+cascade:
+  max_attempts: 3
+  budget_s: 20
+  lease_s: 30
+  lookup_retries: 3
+  unknown_max_age_s: 900
+providers:
+  mock_a:    {type: mock, base_url: http://mock_a:8000, timeout_s: 3, failure_threshold: 3, cooldown_s: 30}
+  mock_b:    {type: mock, base_url: http://mock_b:8000, timeout_s: 3, failure_threshold: 3, cooldown_s: 30}
+  braintree: {type: braintree, enabled: false, timeout_s: 10, failure_threshold: 3, cooldown_s: 30}
+routes:
+  - match: {currency: [EUR], country: [DE, FR]}
+    providers: [mock_b, mock_a]
+  - match: {amount_minor_gte: 50000}
+    providers: [mock_a]
+  - match: {currency: [GBP]}
+    providers: [{split: {mock_a: 70, mock_b: 30}}]
+  - default: true
+    providers: [mock_a, mock_b]
