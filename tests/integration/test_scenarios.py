@@ -308,14 +308,51 @@ async def test_s9_duplicate_webhook_and_late_success(env: Harness) -> None:
     assert p["needs_review"] is False
 
 
-async def test_webhook_resolves_pending_payment(env: Harness) -> None:
+async def test_success_webhook_is_verified_by_lookup(env: Harness) -> None:
     await env.script("mock_a", "timeout_charged")
     await env.flags("mock_a", lookup_down=True, cancel_down=True, webhooks="once")
     p = (await env.pay()).json()
     assert p["status"] == "PENDING_RECONCILIATION"
+    # Lookup still down: the webhook cannot be verified, reconciliation decides later.
+    assert [r["status"] for r in await env.deliver_webhooks("mock_a")] == ["deferred"]
+    assert (await env.get(p["id"]))["status"] == "PENDING_RECONCILIATION"
+    await env.flags("mock_a", lookup_down=False, cancel_down=False)
+    await env.svc.engine.sweep()
+    p = await env.assert_ledger_invariant(p["id"])
+    assert p["status"] == "SUCCEEDED"
+    assert statuses(p) == [("mock_a", "SUCCEEDED")]
+
+
+async def test_webhook_applies_when_lookup_confirms(env: Harness) -> None:
+    await env.script("mock_a", "timeout_charged")
+    await env.flags("mock_a", lookup_down=True, cancel_down=True, webhooks="once")
+    p = (await env.pay()).json()
+    await env.flags("mock_a", lookup_down=False)
     assert [r["status"] for r in await env.deliver_webhooks("mock_a")] == ["applied"]
     p = await env.assert_ledger_invariant(p["id"])
     assert p["status"] == "SUCCEEDED"
+
+
+async def test_stale_success_webhook_after_our_void_is_not_trusted(env: Harness) -> None:
+    """Regression found by the property test.
+
+    A charged, the response was lost; lookup down; our cancel voided the charge but A does
+    not guarantee the reference cannot be charged later, so the payment is parked. Then
+    A's "charge.succeeded" webhook (emitted before the void) arrives. Trusting it would
+    make the payment SUCCEEDED with zero charges.
+    """
+    await env.script("mock_a", "timeout_charged")
+    await env.flags("mock_a", lookup_down=True, cancel_blocks_late_charge=False, webhooks="once")
+    env.svc.adapters["mock_a"].cancel_blocks_late_charge = False  # type: ignore[misc]
+    p = (await env.pay()).json()
+    assert p["status"] == "PENDING_RECONCILIATION"
+    assert await env.charged(p) == 0  # our cancel voided it
+
+    await env.flags("mock_a", lookup_down=False)
+    assert [r["status"] for r in await env.deliver_webhooks("mock_a")] == ["verified_not_charged"]
+    await env.svc.engine.sweep()  # resumes the cascade: A is voided, B is tried
+    p = await env.assert_ledger_invariant(p["id"])
+    assert statuses(p) == [("mock_a", "VOIDED"), ("mock_b", "SUCCEEDED")]
 
 
 async def test_webhook_signature_required(env: Harness) -> None:

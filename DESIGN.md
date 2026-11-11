@@ -1,4 +1,4 @@
-# DESIGN (M1)
+# DESIGN
 
 Payment cascading service: one customer payment is tried against an ordered list of
 providers; on a "someone else could approve this" failure the next one is tried. The
@@ -41,10 +41,14 @@ stateDiagram-v2
 ```
 
 `CREATED -> FAILED` is not drawn in the spec's diagram but is required by 8.1 step 2
-(empty route fails before the payment is ever claimed). Recorded in `NOTES.md`.
+(empty route fails before the payment is ever claimed).
 
 Taking over a `PROCESSING` payment whose lease expired is **not** a status change: it is
-the conditional `UPDATE ... WHERE lease_until < now()` claim from 8.1 step 3.
+the conditional `UPDATE ... WHERE lease_until < now()` claim from 8.1 step 3. The claim
+also writes a fresh `lease_owner` token; every later engine write checks (and renews) it
+in the same short transaction, so a worker that lost its claim cannot write anything.
+In `PENDING_RECONCILIATION` the `lease_until` column means "not before": the next time
+reconciliation may claim the payment (backoff).
 
 ## Attempt state machine
 
@@ -60,9 +64,20 @@ stateDiagram-v2
     UNKNOWN --> DECLINED_SOFT
     UNKNOWN --> DECLINED_HARD
     UNKNOWN --> FAILED_NOT_CHARGED
-    UNKNOWN --> VOIDED: cancel() ok and cancel_blocks_late_charge
-    SUCCEEDED --> REFUNDED_DUPLICATE: late success on an already-settled payment, cancelled
+    UNKNOWN --> VOIDED: cancel() ok and cancel_blocks_late_charge / lookup says voided
+    SUCCEEDED --> REFUNDED_DUPLICATE
+    UNKNOWN --> REFUNDED_DUPLICATE
+    DECLINED_SOFT --> REFUNDED_DUPLICATE
+    DECLINED_HARD --> REFUNDED_DUPLICATE
+    FAILED_NOT_CHARGED --> REFUNDED_DUPLICATE
+    VOIDED --> REFUNDED_DUPLICATE
 ```
+
+`* -> REFUNDED_DUPLICATE` is the late-success path (8.3): the provider reports a charge
+for an attempt we had already settled (or for a payment that is already terminal), we
+cancelled that charge. It deliberately does not go through `SUCCEEDED`, so the partial
+unique index "one SUCCEEDED attempt per payment" never gets in the way. A late success
+on a declined/voided attempt never turns it into `SUCCEEDED`.
 
 ## One transition function
 
@@ -75,9 +90,46 @@ return a `Transition` with `kind`:
 | `DUPLICATE` | `current == target` | — (`require()` raises: a bug) | no-op, 200 |
 | `REJECTED` | no such edge (e.g. stale event on a final attempt) | `require()` raises | no-op, log, 200 |
 
-The function is pure; persistence (M2+) will be a conditional
+The function is pure; the repository calls it before every conditional
 `UPDATE ... SET status=:target WHERE id=:id AND status=:current`, so two writers racing on
 the same row cannot both apply a transition.
+
+## Engine loop
+
+The engine never decides from what it "just did"; each iteration re-reads the payment and
+its attempts and looks at the **last attempt**:
+
+| last attempt | action |
+|---|---|
+| none / money-free (`DECLINED_SOFT`, `FAILED_NOT_CHARGED`, `VOIDED`) | budget, route and `max_attempts` left? write-ahead next attempt, `charge()`, report to breaker, persist; else `FAILED` with the last reason |
+| `SUCCEEDED` | done (payment was settled in the same transaction) |
+| `DECLINED_HARD` | `FAILED`, stop |
+| `STARTED` | previous worker crashed mid-call (or our write was lost): `UNKNOWN` |
+| `UNKNOWN` | 8.2: lookup ×N → cancel (if it blocks late charges) → else `PENDING_RECONCILIATION` + enqueue reconcile |
+
+A webhook, a crashed predecessor or a lost write therefore all go through the same path.
+Reconciliation (`PENDING_RECONCILIATION`) does one lookup per round; resolved → back into
+the same loop (resume cascade if the deadline allows); still unknown → park again with
+backoff; older than `unknown_max_age_s` → best-effort cancel, `FAILED`, `needs_review`.
+The periodic sweep (inside the worker) picks up expired `PROCESSING` leases, due
+`PENDING_RECONCILIATION` payments and `CREATED` payments older than the lease.
+
+## Webhooks
+
+Signature (HMAC-SHA256 of the raw body, `X-Signature`) → insert into `webhook_events`
+(duplicate `(provider, event_id)` → 200, no-op) → apply. A **success** event is only a
+trigger: the handler calls `lookup()` and applies the provider's *current* state through the
+same transitions as polling (a webhook can be stale — e.g. sent before our own cancel voided
+the charge). Lookup unavailable → defer to reconciliation. Success for an attempt that is
+already settled, or a payment that is already terminal → late-success handling: cancel →
+`REFUNDED_DUPLICATE`, or `needs_review` if the cancel fails. If applying fails, the event row
+is deleted and 500 is returned so the provider redelivers.
+
+## Lookup extension
+
+`LookupResult` has one value beyond section 7: `VOIDED` (the reference existed and was
+voided, e.g. our earlier cancel went through but its response was lost). It maps to
+attempt `VOIDED` — holds no money, cannot be charged.
 
 ## Decline taxonomy
 

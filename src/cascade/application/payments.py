@@ -11,10 +11,10 @@ from uuid import UUID, uuid4
 from cascade.application.engine import CascadeEngine
 from cascade.application.ports import AttemptUpdate, PaymentRepository, TaskQueue
 from cascade.domain.entities import Attempt, NewPayment, Payment
-from cascade.domain.enums import AttemptStatus, CancelStatus, PaymentStatus
+from cascade.domain.enums import AttemptStatus, CancelStatus, LookupStatus, PaymentStatus
 from cascade.domain.money import Money
-from cascade.domain.outcomes import attempt_status_for_decline
-from cascade.domain.providers import ProviderAdapter
+from cascade.domain.outcomes import attempt_status_for_decline, attempt_status_for_lookup
+from cascade.domain.providers import LookupResult, ProviderAdapter
 from cascade.domain.taxonomy import NormalizedReason
 from cascade.domain.transitions import ATTEMPT_UNRESOLVED, transition_attempt
 
@@ -122,16 +122,40 @@ class ProviderEvents:
         return await self._on_decline(p, a, ev)
 
     async def _on_success(self, p: Payment, a: Attempt, ev: ProviderEvent) -> str:
+        """A success webhook is a hint, not the truth: it can be stale (sent before our own
+        cancel voided the charge). The provider's current state comes from lookup()."""
         if a.status in (A.SUCCEEDED, A.REFUNDED_DUPLICATE):
             return "duplicate"
-        data = AttemptUpdate(raw_code=ev.raw_code, provider_txn_id=ev.provider_txn_id)
+        adapter = self.adapters.get(a.provider)
+        lr = await adapter.lookup(str(a.id)) if adapter else LookupResult(LookupStatus.UNKNOWN)
+
         if a.status in ATTEMPT_UNRESOLVED and p.status in (P.PROCESSING, P.PENDING_RECONCILIATION):
-            if await self.repo.succeed(p.id, a.id, a.status, data, token=None):
-                return "applied"
-            a = await self.repo.get_attempt(a.id) or a  # raced; fall through with fresh state
-            if a.status is A.SUCCEEDED:
+            to = attempt_status_for_lookup(lr.status, lr.reason)
+            if to is None:  # cannot verify now: reconciliation will
+                if p.status is P.PENDING_RECONCILIATION:
+                    await self.queue.enqueue_reconcile(p.id)
+                return "deferred"
+            data = AttemptUpdate(
+                reason=lr.reason.value if lr.reason else None,
+                raw_code=lr.raw_code,
+                provider_txn_id=lr.provider_txn_id or ev.provider_txn_id,
+            )
+            if to is A.SUCCEEDED:
+                applied = await self.repo.succeed(p.id, a.id, a.status, data, token=None)
+            else:
+                applied = await self.repo.update_attempt(a.id, a.status, to, data, token=None)
+                if applied and p.status is P.PENDING_RECONCILIATION:
+                    await self.queue.enqueue_reconcile(p.id)  # resume or fail the cascade
+            if applied:
+                return "applied" if to is A.SUCCEEDED else "verified_not_charged"
+            a = await self.repo.get_attempt(a.id) or a  # raced: decide on fresh state
+            if a.status in (A.SUCCEEDED, A.REFUNDED_DUPLICATE):
                 return "duplicate"
-        return await self.handle_late_success(p, a)
+            p = await self.repo.get(p.id) or p
+
+        if lr.status in (LookupStatus.VOIDED, LookupStatus.DECLINED, LookupStatus.NOT_FOUND):
+            return "ignored_stale"  # provider says nothing is charged now
+        return await self.handle_late_success(p, a)  # APPROVED, or UNKNOWN: cancel to be safe
 
     async def handle_late_success(self, p: Payment, a: Attempt) -> str:
         """Provider charged an attempt we already settled otherwise (8.3). Undo that charge.

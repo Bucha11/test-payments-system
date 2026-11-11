@@ -1,8 +1,11 @@
-.PHONY: up down logs test test-unit lint typecheck demo migrate
+SHELL := /bin/bash
 
-# Tests run on the host against Postgres/Redis published by compose.
-TEST_ENV = DATABASE_URL=postgresql+asyncpg://cascade:cascade@localhost:5432/cascade \
-           REDIS_URL=redis://localhost:6379/0
+.PHONY: up down logs test test-unit lint typecheck demo demo-save
+
+# Tests run on the host against Postgres/Redis published by compose, in their own
+# database / Redis db, so a running worker never touches test data.
+TEST_ENV = DATABASE_URL=postgresql+asyncpg://cascade:cascade@localhost:5432/cascade_test \
+           TEST_REDIS_URL=redis://localhost:6379/15
 
 .env:
 	cp .env.example .env
@@ -18,6 +21,9 @@ logs:
 
 test: .env
 	docker compose up -d --wait postgres redis
+	docker compose exec -T postgres psql -U cascade -tAc \
+	  "SELECT 1 FROM pg_database WHERE datname='cascade_test'" | grep -q 1 \
+	  || docker compose exec -T postgres createdb -U cascade cascade_test
 	$(TEST_ENV) uv run alembic upgrade head
 	$(TEST_ENV) uv run pytest -q
 
@@ -33,3 +39,7 @@ typecheck:
 
 demo:
 	uv run python scripts/demo.py
+
+# Records a real run into docs/demo-output.txt (embedded in the README).
+demo-save:
+	set -o pipefail; uv run python scripts/demo.py 2>&1 | tee docs/demo-output.txt

@@ -1,45 +1,80 @@
 # NOTES
 
-Things noticed while building that are outside the current milestone, open questions for
-review, and environment caveats. Nothing here is built unless a milestone asks for it.
+Decisions taken where the spec was silent or self-contradictory, things deliberately left
+out, and environment caveats.
 
-## Open questions for review (M1)
+## Decisions (taken after M1 review: "go on")
 
-1. **`CREATED -> FAILED`.** Section 5.1 diagram has no such edge, but 8.1 step 2 fails a
-   payment with `no_route` before it is claimed. Added the edge; alternative is to claim
-   first and fail from PROCESSING. Chosen: the edge (no lease taken for a payment that
-   never calls a provider).
+1. **`CREATED -> FAILED` (`no_route`).** 5.1's diagram has no such edge, but 8.1 step 2
+   fails a payment before it is claimed. The edge exists.
+2. **Late success on a settled attempt (S9).** 5.2 only had `SUCCEEDED -> REFUNDED_DUPLICATE`,
+   but the engine only moves past an attempt once it is DECLINED_*, FAILED_NOT_CHARGED or
+   VOIDED, so a late "charged" for it could not be recorded and the money would stay on the
+   card. Added `{UNKNOWN, DECLINED_SOFT, DECLINED_HARD, FAILED_NOT_CHARGED, VOIDED} ->
+   REFUNDED_DUPLICATE` (never via SUCCEEDED, so the one-success index holds).
+3. **Fencing token `payments.lease_owner`** (migration 0002). The spec's claim query alone
+   lets a worker whose lease expired keep writing after the sweep took over. Every engine
+   write checks and renews the token in the same transaction.
+4. **`LookupStatus.VOIDED`** in addition to section 7's four values (see DESIGN.md).
+5. **Deadline uses the engine's clock** (`deadline_at` computed in the application, not by
+   `now()` in SQL), so deadline checks and deadline creation use one time source.
+6. **Reconciliation backoff and next check.** No delayed-task infrastructure: a parked
+   payment stores its next-check time in `lease_until`; the worker's sweep (every
+   `sweep_interval_s`) picks up due ones. The first check is enqueued immediately.
+7. **Sweep runs inside the worker** (a loop started on worker startup) rather than a
+   separate `taskiq scheduler` container: cron granularity is one minute, too slow for
+   S7, and concurrent sweepers are harmless because claims are atomic. A `sweep` task is
+   registered too, for manual kicks.
+8. **Half-open probe slot is taken at route-build time.** If the probed provider is not
+   first in the route and the payment succeeds earlier, the probe is unused until its key
+   expires (= cooldown). Acceptable; noted.
+9. **Mock decline codes** are descriptive (`do_not_honor`, `insufficient_funds`, ...) plus a
+   few ISO-8583 numerics; the adapter maps them, unknown codes become `unmapped` (hard).
+   `soft_decline` / `hard_decline` without a code default to `do_not_honor` /
+   `insufficient_funds`.
+10. **Mock admin extras:** `GET /_admin/webhooks` (outbox, used to deliver webhooks in tests)
+    and `GET /_admin/calls` (charge calls, used to assert "B never called").
+11. **Idempotent replay status code:** a replay returns the current state: 201 if terminal,
+    202 if still in flight.
+12. **Property test** configures adapters truthfully (`cancel_blocks_late_charge` equals the
+    mock flag). A provider that lies about cancel is only recoverable through a webhook;
+    that case is S9.
 
-2. **Late success on a non-SUCCEEDED attempt (S9).** 5.2 only allows
-   `SUCCEEDED -> REFUNDED_DUPLICATE`. But the engine can only move past provider A when A's
-   attempt is DECLINED_*, FAILED_NOT_CHARGED or VOIDED, all of which are final. So a late
-   "succeeded" webhook for A would be REJECTED by the transition function, and the money
-   would be left on the card. For S9 (and real life: a provider that mis-reports a
-   decline, or a cancel that did not really block the charge) the late-success handler
-   needs a way to record "provider says this reference is charged". Proposal for M4:
-   keep the attempt graph as is, and let the late-success handler act on the *provider
-   claim* rather than on the attempt status: call `cancel()`; on success mark the attempt
-   `REFUNDED_DUPLICATE` via an explicit extra edge
-   `{DECLINED_SOFT, FAILED_NOT_CHARGED, VOIDED} -> REFUNDED_DUPLICATE` (never through
-   SUCCEEDED, so the partial unique index is never violated); on failure set
-   `needs_review`. Needs a decision before M4.
+13. **A success webhook is a hint, verified by lookup.** Found by the property test: A
+    charged, the response was lost, lookup was down, our cancel voided the charge (A does
+    not guarantee no later charge, so the payment was parked) — then A's
+    `charge.succeeded`, emitted *before* the void, arrived and was trusted: SUCCEEDED with
+    zero charges. Now the webhook handler asks `lookup()` for the current state and applies
+    that; if lookup is unavailable it defers to reconciliation. For late success it ignores
+    the event when lookup says nothing is charged, and cancels when lookup is APPROVED or
+    unavailable (cancel is idempotent, so cancelling "to be safe" cannot hurt). Decline
+    webhooks are applied directly (a decline cannot be undone by our cancel). Regression test:
+    `test_stale_success_webhook_after_our_void_is_not_trusted`.
 
-3. **Transition outcome for stale events.** The spec says duplicates and out-of-order
-   events are no-ops. The transition function distinguishes `DUPLICATE` (same state) from
-   `REJECTED` (no such edge); webhook/polling treat both as no-ops, the engine treats both
-   as a bug. See DESIGN.md.
+## Residual risks (by design, flagged not hidden)
 
-## Environment caveats
+* A provider that reports "declined" and later charges anyway, while the cascade already
+  succeeded elsewhere: the webhook path cancels the late charge; if that cancel fails the
+  payment is flagged `needs_review`. Without a webhook nothing notices it; a periodic
+  provider-side settlement report reconciliation would (out of scope).
+* `unknown_max_age_s` exceeded with lookup still failing: `FAILED` + `needs_review`; if the
+  provider did charge, it is a manual case by definition.
 
-* In the sandbox this was built in, Docker Hub returned 429 and container builds had no
-  outbound network. The compose stack was verified with the same images pulled from
-  `mirror.gcr.io` and the app image built with the sandbox proxy CA injected through a
-  throw-away Dockerfile (not committed). On a normal machine `make up` needs nothing extra.
-* redis-py ≥ 8 defaults `socket_timeout` to 5 s; taskiq-redis consumes with an unbounded
-  BRPOP, so the worker crashed every 5 s. The broker sets `socket_timeout=None` explicitly
-  (connect timeout stays 5 s).
+## Milestone status
 
-## Braintree (M7)
+* M1–M5: done; scenarios S1–S12 and the property test are green.
+* M6.1 `/stats`, `/providers`: done, S13 green; the demo prints both.
+* M6.2 weighted routing: done, S14 green (unit test).
+* M6.3 GitHub Actions: ruff, mypy (domain + application, strict), `make test`.
+* M7 Braintree: **not done** — no sandbox credentials in `.env`, and section 15 details are
+  explicitly unverified. `braintree` stays in `routing.yaml` with `enabled: false`; no adapter
+  is built for it, so it never enters a route.
 
-Not started. Section 15 details are unverified by design; adapter will stay behind
-`enabled: false` until checked against official docs.
+## Environment caveats (the sandbox this was built in)
+
+* Docker Hub returned 429 and container builds had no direct network. The stack was run
+  with the same images from `mirror.gcr.io` and the app image built with the sandbox
+  proxy CA injected through a throw-away Dockerfile (not committed). `docs/demo-output.txt`
+  is from that real run. On a normal machine `make up` needs nothing extra.
+* redis-py >= 8 defaults `socket_timeout` to 5 s; taskiq-redis consumes with an unbounded
+  BRPOP, so the worker died every 5 s. The broker sets `socket_timeout=None` explicitly.
