@@ -1,5 +1,6 @@
 """Wiring: builds every service from settings + config. One place, no framework magic."""
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -19,8 +20,11 @@ from cascade.infrastructure.breaker import BreakerPolicy, RedisCircuitBreaker
 from cascade.infrastructure.config_loader import load_routing_config
 from cascade.infrastructure.db.repo import SqlPaymentRepository
 from cascade.infrastructure.db.session import make_engine, make_sessionmaker
+from cascade.infrastructure.providers.braintree import BraintreeAdapter
 from cascade.infrastructure.providers.mock import MockProviderAdapter
 from cascade.infrastructure.settings import Settings
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,7 +57,9 @@ class _NullQueue:
 
 
 def build_adapters(
-    config: RoutingConfig, transports: Mapping[str, httpx.AsyncBaseTransport] | None = None
+    config: RoutingConfig,
+    transports: Mapping[str, httpx.AsyncBaseTransport] | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, ProviderAdapter]:
     adapters: dict[str, ProviderAdapter] = {}
     for name, pc in config.providers.items():
@@ -70,7 +76,21 @@ def build_adapters(
                 ),
                 transport=(transports or {}).get(name),
             )
-        # type == "braintree": optional M7, not built (see NOTES.md).
+        elif pc.type == "braintree":
+            if settings is None or not settings.braintree_configured:
+                log.warning("braintree credentials not set; provider %s disabled", name)
+                continue
+            adapters[name] = BraintreeAdapter.create(
+                name,
+                merchant_id=settings.braintree_merchant_id,
+                public_key=settings.braintree_public_key,
+                private_key=settings.braintree_private_key,
+                environment=settings.braintree_environment,
+                timeout_s=pc.timeout_s,
+                currencies=pc.currencies,
+                merchant_account_id=pc.merchant_account_id,
+                cancel_blocks_late_charge=bool(pc.cancel_blocks_late_charge),
+            )
     return adapters
 
 
@@ -88,7 +108,7 @@ def build_services(
     sm = make_sessionmaker(db)
     redis = Redis.from_url(settings.redis_url, socket_timeout=2, socket_connect_timeout=2)
     repo = SqlPaymentRepository(sm, lease_s=config.cascade.lease_s)
-    adapters = build_adapters(config, transports)
+    adapters = build_adapters(config, transports, settings)
     breaker = RedisCircuitBreaker(
         redis,
         {n: BreakerPolicy(p.failure_threshold, p.cooldown_s) for n, p in config.providers.items()},

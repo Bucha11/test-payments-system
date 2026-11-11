@@ -28,6 +28,12 @@ jobs:
       - run: uv sync --frozen
       - name: make test (Postgres + Redis from docker compose)
         run: make test
+        env:
+          # Braintree sandbox tests run when these repository secrets exist; without them
+          # (e.g. pull requests from forks) they are skipped.
+          BRAINTREE_MERCHANT_ID: ${{ secrets.BRAINTREE_MERCHANT_ID }}
+          BRAINTREE_PUBLIC_KEY: ${{ secrets.BRAINTREE_PUBLIC_KEY }}
+          BRAINTREE_PRIVATE_KEY: ${{ secrets.BRAINTREE_PRIVATE_KEY }}
       - name: compose logs on failure
         if: failure()
         run: docker compose logs postgres redis

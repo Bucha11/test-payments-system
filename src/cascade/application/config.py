@@ -1,4 +1,4 @@
-"""Routing/cascade configuration (section 9). Validated at startup; invalid -> fail fast."""
+"""Routing/cascade configuration. Validated at startup; invalid -> fail fast."""
 
 from typing import Literal, Self
 
@@ -15,9 +15,9 @@ class CascadeSettings(_Strict):
     lease_s: PositiveFloat = 30
     lookup_retries: PositiveInt = 3
     unknown_max_age_s: PositiveFloat = 900
-    # Not in the spec's example; explicit knobs for the policies the spec describes.
-    lookup_backoff_s: float = Field(default=0.2, ge=0)  # 8.2: "short backoff", doubled per try
-    reconcile_backoff_min_s: float = Field(default=1, ge=0)  # 8.3: "reschedule with backoff"
+    # Backoff and sweep knobs for the unknown-outcome and reconciliation policies.
+    lookup_backoff_s: float = Field(default=0.2, ge=0)  # between lookups, doubled per try
+    reconcile_backoff_min_s: float = Field(default=1, ge=0)  # reconciliation re-check backoff
     reconcile_backoff_max_s: float = Field(default=60, ge=0)
     sweep_interval_s: PositiveFloat = 2
 
@@ -31,6 +31,10 @@ class ProviderConfig(_Strict):
     cooldown_s: PositiveFloat
     # None = adapter default (mock: True, braintree: False).
     cancel_blocks_late_charge: bool | None = None
+    # Currencies the provider's account can settle; None = any. A payment in another
+    # currency is declined by the adapter without a network call (soft: cascade on).
+    currencies: list[str] | None = None
+    merchant_account_id: str | None = None  # braintree: None = the account's default
 
     @model_validator(mode="after")
     def _mock_needs_url(self) -> Self:
@@ -86,4 +90,18 @@ class RoutingConfig(_Strict):
         defaults = [i for i, r in enumerate(self.routes) if r.default]
         if defaults != [len(self.routes) - 1]:
             raise ValueError("exactly one default route is required and it must be last")
+        # The lease is renewed on every engine write. The longest stretch without a write is
+        # one attempt: charge, then lookup_retries lookups with backoff, then cancel. If that
+        # outlasts the lease, a sweeper takes the payment over mid-step (safe thanks to
+        # fencing, but it duplicates provider calls and the first worker's work is lost).
+        c = self.cascade
+        backoff = sum(c.lookup_backoff_s * 2**i for i in range(c.lookup_retries - 1))
+        for name, p in self.providers.items():
+            worst = p.timeout_s * (c.lookup_retries + 2) + backoff
+            if p.enabled and worst >= c.lease_s:
+                raise ValueError(
+                    f"providers.{name}: one attempt can take {worst:.1f}s "
+                    f"(timeout_s x (lookup_retries + 2) + backoff), "
+                    f"not below cascade.lease_s={c.lease_s}"
+                )
         return self

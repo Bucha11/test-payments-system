@@ -16,6 +16,7 @@ dependencies = [
     "taskiq-redis>=1.0",
     "httpx>=0.28",
     "pyyaml>=6.0",
+    "braintree>=4.30",
 ]
 
 [dependency-groups]
@@ -42,6 +43,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = ["integration: needs Postgres/Redis from docker compose"]
+filterwarnings = ["ignore::DeprecationWarning:braintree.*"]
 
 [tool.ruff]
 line-length = 100

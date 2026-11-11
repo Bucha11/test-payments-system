@@ -11,6 +11,18 @@ class Settings(BaseSettings):
     routing_config: str = "config/routing.yaml"
     webhook_secret: str = "dev-webhook-secret"
     log_level: str = "INFO"
+    # Braintree (optional). Empty credentials: the adapter is not built, the provider
+    # never enters a route.
+    braintree_environment: str = "sandbox"
+    braintree_merchant_id: str = ""
+    braintree_public_key: str = ""
+    braintree_private_key: str = ""
+
+    @property
+    def braintree_configured(self) -> bool:
+        return bool(
+            self.braintree_merchant_id and self.braintree_public_key and self.braintree_private_key
+        )
 
 
 @lru_cache

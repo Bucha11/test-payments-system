@@ -9,6 +9,7 @@ UNKNOWN outcomes across payments, so scenarios with timeouts on A are interleave
 healthy ones, and S4 (which deliberately opens A's breaker) runs last.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -25,6 +26,29 @@ MOCKS = {
     "mock_b": os.environ.get("MOCK_B_URL", "http://localhost:8102"),
 }
 TERMINAL = {"SUCCEEDED", "FAILED"}
+
+
+def _braintree() -> Any:
+    """Braintree adapter for the ledger check (credentials from .env), or None."""
+    try:
+        from cascade.infrastructure.providers.braintree import BraintreeAdapter
+        from cascade.infrastructure.settings import Settings
+    except ImportError:
+        return None
+    st = Settings()
+    if not st.braintree_configured:
+        return None
+    return BraintreeAdapter.create(
+        "braintree",
+        merchant_id=st.braintree_merchant_id,
+        public_key=st.braintree_public_key,
+        private_key=st.braintree_private_key,
+        environment=st.braintree_environment,
+        timeout_s=15,
+    )
+
+
+BRAINTREE = _braintree()
 
 http = httpx.Client(timeout=30)
 violations: list[str] = []
@@ -85,6 +109,10 @@ def ledger_charges(p: dict[str, Any]) -> int:
     for name in MOCKS:
         for ref, e in mock(name, "/_admin/ledger").items():
             if ref in refs and e["state"] == "charged":
+                n += 1
+    for a in p["attempts"]:
+        if a["provider"] == "braintree" and BRAINTREE is not None:
+            if asyncio.run(BRAINTREE.lookup(a["id"])).status.value == "APPROVED":
                 n += 1
     return n
 
@@ -212,6 +240,29 @@ def s10() -> None:
     run("S10 A and B soft decline -> FAILED, route exhausted")
 
 
+def bt() -> None:
+    providers = {p["name"]: p for p in http.get(f"{API}/providers").json()}
+    if not providers.get("braintree", {}).get("enabled"):
+        print("\n=== BT  skipped: Braintree sandbox credentials are not set in .env")
+        return
+    # Route for USD + country US: [braintree, mock_a]. Sandbox test amounts pick the outcome.
+    setup()
+    run("BT1 US card: Braintree sandbox approves", country="US", amount_minor=1999)
+    setup()
+    run(
+        "BT2 Braintree soft decline (2000 Do Not Honor) -> mock_a approves",
+        country="US",
+        amount_minor=200_000,
+    )
+    setup()
+    run(
+        "BT3 Braintree hard decline (2001 Insufficient Funds) -> stop, mock_a never called",
+        country="US",
+        amount_minor=200_100,
+    )
+    print(f"  mock_a charge calls: {len(mock('mock_a', '/_admin/calls'))}")
+
+
 def s4() -> None:
     setup(a=["error_500", "error_500", "error_500"])
     for i in range(3):
@@ -226,7 +277,7 @@ def s4() -> None:
 
 def main() -> int:
     http.get(f"{API}/health").raise_for_status()
-    for fn in (s1, s5, s2, s6, s3, s7, s8, s9, s10, s4):
+    for fn in (s1, s5, s2, s6, s3, s7, s8, s9, s10, bt, s4):
         fn()
     print("\n=== GET /stats?window_min=60")
     print(json.dumps(http.get(f"{API}/stats", params={"window_min": 60}).json(), indent=2))

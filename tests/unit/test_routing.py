@@ -84,8 +84,15 @@ def _cfg(**over: object) -> dict:
                 "mock_a": {"type": "mock", "timeout_s": 3, "failure_threshold": 3, "cooldown_s": 30}
             }
         },  # mock without base_url
+        {"cascade": {"lease_s": 10}},  # braintree 5 s x (3 lookups + charge + cancel) >= lease
     ],
 )
 def test_invalid_config_fails_fast(bad: dict) -> None:
     with pytest.raises(ValidationError):
         RoutingConfig.model_validate(_cfg(**bad))
+
+
+def test_us_usd_routes_to_braintree_first() -> None:
+    assert route(currency="USD", country="US") == ["braintree", "mock_a"]
+    assert route(currency="USD", country="US", amount=200_000) == ["braintree", "mock_a"]
+    assert route(currency="USD", country=None) == ["mock_a", "mock_b"]
